@@ -1,2 +1,2 @@
 # sharepoint-adapter
-Modulo reponsabel por mudanças necessárias no sharepoint
+Modulo reponsável por mudanças necessárias no sharepoint
