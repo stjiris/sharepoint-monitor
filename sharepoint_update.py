@@ -2,8 +2,15 @@ import asyncio
 from datetime import datetime
 from utils.graph_networking import *
 from dotenv import load_dotenv
+import json
 
 load_dotenv() 
+
+def env_or_fail(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Missing environment variable {name}")
+    return value
 
 def setup_logging_from_env(local_root: str, timestamp: str):
     enable_logging = os.getenv('ENABLE_LOGGING', 'True').lower() in ('true', '1', 'yes')
@@ -40,15 +47,17 @@ def setup_logging_from_env(local_root: str, timestamp: str):
 async def main():
     site_id = env_or_fail("SITE_ID")
     local_root = env_or_fail("LOCAL_ROOT")
+    tenant_id = env_or_fail("TENANT_ID")
+    client_id = env_or_fail("CLIENT_ID")
+    client_secret = env_or_fail("CLIENT_SECRET")
     timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-
+    drives = json.loads(os.getenv('DRIVES', '[]'))
     setup_logging_from_env(local_root, timestamp)
-    obj = SharePointDownloader(site_id, local_root, timestamp)
+    obj = SharePointDownloader(site_id, local_root, timestamp, tenant_id, client_id, client_secret)
     name_ids = await obj.list_all_drives()
-    
 
     for id, name in name_ids:
-        if name == 'Anonimização':
+        if name in drives:
             try:
                 await obj.download_drive(id, name)
             except Exception as e:

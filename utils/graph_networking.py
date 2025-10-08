@@ -1,29 +1,23 @@
-from datetime import datetime
 import hashlib
 import logging
 import os
+import shutil
 from azure.identity import ClientSecretCredential
 from msgraph import GraphServiceClient
 from msgraph.generated.models.drive_item import DriveItem
-from .aux import env_or_fail 
-import shutil
 
 LOGS_DIR = "logs"
 SAVES_DIR = "saves"
 
 class SharePointDownloader:
-    def __init__(self, site_id, local_root, timestamp):
+    def __init__(self, site_id, local_root, timestamp, tenant_id: str, client_id: str, client_secret: str):
         self.logger: logging.Logger = logging.getLogger(__name__)
-        self.client: GraphServiceClient = SharePointDownloader.initializeClient()
+        self.client: GraphServiceClient = SharePointDownloader.initializeClient(tenant_id, client_id, client_secret)
         self.site_id: str = site_id
         self.local_root: str = local_root
         self.timestamp: str = timestamp
 
-    def initializeClient() -> GraphServiceClient:
-        tenant_id = env_or_fail("TENANT_ID")
-        client_id = env_or_fail("CLIENT_ID")
-        client_secret = env_or_fail("CLIENT_SECRET")
-
+    def initializeClient(tenant_id: str, client_id: str, client_secret: str) -> GraphServiceClient:
         cred = ClientSecretCredential(tenant_id=tenant_id, client_id=client_id, client_secret=client_secret)
         scopes = ['https://graph.microsoft.com/.default']
         client = GraphServiceClient(credentials=cred, scopes=scopes)
