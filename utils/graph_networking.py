@@ -6,16 +6,18 @@ from azure.identity import ClientSecretCredential
 from msgraph import GraphServiceClient
 from msgraph.generated.models.drive_item import DriveItem
 from .aux import env_or_fail 
+import shutil
+
+LOGS_DIR = "logs"
+SAVES_DIR = "saves"
 
 class SharePointDownloader:
-    def __init__(self, site_id, local_root, timed_local_root):
+    def __init__(self, site_id, local_root, timestamp):
         self.logger: logging.Logger = logging.getLogger(__name__)
         self.client: GraphServiceClient = SharePointDownloader.initializeClient()
         self.site_id: str = site_id
         self.local_root: str = local_root
-        self.timed_local_root: str = timed_local_root
-
-        os.makedirs(timed_local_root, exist_ok=True)
+        self.timestamp: str = timestamp
 
     def initializeClient() -> GraphServiceClient:
         tenant_id = env_or_fail("TENANT_ID")
@@ -35,8 +37,7 @@ class SharePointDownloader:
     async def download_drive(self, drive_id: str, drive_name: str) -> None:
         resp = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id("root").children.get()
         items = resp.value
-        drive_path = os.path.join(self.timed_local_root, drive_name)
-        os.makedirs(drive_path, exist_ok=True)
+        self.make_folder(drive_name)
 
         for item in items:
             if getattr(item, "folder", None) is not None and getattr(item, "name", None):
@@ -44,12 +45,6 @@ class SharePointDownloader:
             else:
                 if getattr(item, "name", None):
                     await self.download_file(drive_id, drive_name, item)
-
-    def make_folder(self, folder_path):
-        real_path = os.path.join(self.timed_local_root, folder_path)
-        os.makedirs(real_path, exist_ok=True)
-        self.logger.debug(f"Created Folder: {real_path}")
-
 
 
     async def download_folder(self, drive_id: str, current_folder: str, folder_item: DriveItem) -> int:
@@ -72,37 +67,59 @@ class SharePointDownloader:
         
         return folder_total_size
 
-            
     async def download_file(self, drive_id: str, folder_path: str, item: DriveItem) -> int:
-        
+
         file_path = os.path.join(folder_path, item.name)
+        full_file_path = os.path.join(self.local_root, file_path)
+
         content = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id(item.id).content.get()
         
         remote_content = content if isinstance(content, bytes) else b""
         remote_size = len(remote_content)
-        
-        if os.path.exists(os.path.join(self.timed_local_root, file_path)):
-            local_size = os.path.getsize(file_path)
-            
+
+        if os.path.exists(os.path.join(full_file_path)):
+            local_size = os.path.getsize(full_file_path)
+
             if local_size != remote_size:
-                self.logger.info(f"File {item.name} exists but sizes differ ({local_size} vs {remote_size}), downloading...")
+                self.logger.info(f"UPDATE --- {full_file_path} --- File exists but content differs, downloading...")
+                self.save_outdated_file(folder_path, file_path)
+                write_file(full_file_path, remote_content)
             else:
-                local_hash = await calculate_file_hash(file_path)
+                local_hash = await calculate_file_hash(full_file_path)
                 remote_hash = hashlib.sha256(remote_content).hexdigest()
                 
                 if local_hash == remote_hash:
-                    self.logger.info(f"File {item.name} exists and content is identical, skipping download.")
+                    self.logger.info(f"SKIP --- {full_file_path} --- File exists and content is identical")
                     return 0
                 else:
-                    self.logger.info(f"File {item.name} exists but content differs, downloading...")
+                    self.logger.info(f"UPDATE --- {full_file_path} --- File exists but content differs, downloading...")
+                    self.save_outdated_file(folder_path, file_path)
+                    write_file(full_file_path, remote_content)
+
         else:
-            self.logger.info(f"File {item.name} doesn't exist locally, downloading...")
-        
-        with open(os.path.join(self.timed_local_root, file_path), "wb") as f:
-            f.write(remote_content)
-        
-        self.logger.info(f"Downloaded ({remote_size} bytes) {item.name}")
+            self.logger.info(f"INSERT --- {full_file_path} --- File doesn't exist locally, downloading...")
+            write_file(full_file_path, remote_content)
         return remote_size
+    
+    def make_folder(self, folder_path: str):
+        folder_path = os.path.join(self.local_root, folder_path)
+        os.makedirs(folder_path, exist_ok=True)
+    
+    def save_outdated_file(self, folder_path: str, file_path: str):
+        saves_dir = os.path.join(self.local_root, SAVES_DIR)
+        saves_dir = os.path.join(saves_dir, self.timestamp)
+        destination_folder_path = os.path.join(saves_dir, folder_path)
+
+        os.makedirs(destination_folder_path, exist_ok=True)
+
+        destination_file_path = os.path.join(saves_dir, file_path)
+        
+        origin = os.path.join(self.local_root, file_path)
+        shutil.copy(origin, destination_file_path)
+
+        print("Copied file: " + origin + " to file " + destination_file_path)
+        
+        
 
 async def calculate_file_hash(file_path: str) -> str:
     sha256_hash = hashlib.sha256()
@@ -110,3 +127,7 @@ async def calculate_file_hash(file_path: str) -> str:
         for chunk in iter(lambda: f.read(4096), b""):
             sha256_hash.update(chunk)
     return sha256_hash.hexdigest()
+
+def write_file(file_path: str, content: bytes):
+    with open(os.path.join(file_path), "wb") as f:
+        f.write(content)

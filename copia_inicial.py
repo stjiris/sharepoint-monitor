@@ -5,27 +5,22 @@ from dotenv import load_dotenv
 
 load_dotenv() 
 
-def setup_logging_from_env(local_root: str):
+def setup_logging_from_env(local_root: str, timestamp: str):
     enable_logging = os.getenv('ENABLE_LOGGING', 'True').lower() in ('true', '1', 'yes')
     log_level = os.getenv('LOG_LEVEL', 'INFO')
-    log_directory = "logs"
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     if not enable_logging:
         logging.getLogger().setLevel(logging.CRITICAL)
-        return timestamp
     
-    log_directory = os.path.join(local_root, log_directory)
-    timed_local_root = local_root + '/' + timestamp
-    os.makedirs(timed_local_root, exist_ok=True)
+    log_directory = os.path.join(local_root, LOGS_DIR)
+    log_file = os.path.join(log_directory, f"{timestamp}.log")
 
-    log_file = os.path.join(timed_local_root, f"{timestamp}.log")
-    
+    os.makedirs(log_directory, exist_ok=True)
     level = getattr(logging, log_level.upper(), logging.INFO)
     
     logging.basicConfig(
         level=level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format='%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
         handlers=[*([logging.FileHandler(log_file, encoding='utf-8')])]
     )
@@ -41,16 +36,14 @@ def setup_logging_from_env(local_root: str):
         logger.propagate = False
 
     logging.info(f"Logging to file: {log_file}")
-    return timestamp
 
 async def main():
     site_id = env_or_fail("SITE_ID")
     local_root = env_or_fail("LOCAL_ROOT")
-    formatted = setup_logging_from_env(local_root)
-    timed_local_root = local_root + '/' + formatted
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 
-
-    obj = SharePointDownloader(site_id, local_root, timed_local_root)
+    setup_logging_from_env(local_root, timestamp)
+    obj = SharePointDownloader(site_id, local_root, timestamp)
     name_ids = await obj.list_all_drives()
     
 
