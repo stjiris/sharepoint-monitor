@@ -40,7 +40,13 @@ class SharePointDownloader:
                 if getattr(item, "name", None):
                     await self.download_file(drive_id, drive_name, item)
 
+    async def list_listeners(self):
+        result = await self.client.identity.authentication_event_listeners.get()
+        print(result)
 
+    ###################
+    ### AUX METHODS ###
+    ###################
     async def download_folder(self, drive_id: str, current_folder: str, folder_item: DriveItem) -> int:
         folder_path = os.path.join(current_folder, folder_item.name)
         self.make_folder(folder_path)
@@ -112,7 +118,6 @@ class SharePointDownloader:
         shutil.copy(origin, destination_file_path)
 
         print("Copied file: " + origin + " to file " + destination_file_path)
-        
         
 
 async def calculate_file_hash(file_path: str) -> str:
