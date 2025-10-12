@@ -55,7 +55,7 @@ async def main():
     setup_logging_from_env(local_root, timestamp)
     obj = SharePointDownloader(site_id, local_root, timestamp, tenant_id, client_id, client_secret)
     name_ids = await obj.list_all_drives()
-
+    #await obj.test_hash_algorithm()
     for id, name in name_ids:
         if name in drives:
             try:
