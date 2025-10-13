@@ -89,18 +89,6 @@ class QuickXorHash:
     def base64(self) -> str:
         return base64.b64encode(self.digest()).decode("ascii")
     
-def quickxorhash_bytes(data: bytes) -> bytes:
-    h = QuickXorHash()
-    h.write(data)
-    return h.digest()
-
-
-def quickxorhash_base64(data: bytes) -> str:
-    h = QuickXorHash()
-    h.write(data)
-    return h.base64()
-
-
 def quickxorhash_file_base64(path: str, chunk_size: int = 64 * 1024) -> str:
     h = QuickXorHash()
     with open(path, "rb") as f:

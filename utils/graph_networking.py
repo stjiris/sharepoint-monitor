@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 import shutil
 import struct
 from typing import Optional
@@ -8,9 +9,10 @@ from msgraph import GraphServiceClient
 from msgraph.generated.models.drive_item import DriveItem
 import base64
 from .quickxorhash import quickxorhash_file_base64
-
+from .aux import list_files_relative
 LOGS_DIR = "logs"
 SAVES_DIR = "saves"
+TMP_DIR = "tmp"
 
 class SharePointDownloader:
     def __init__(self, site_id, local_root, timestamp, tenant_id: str, client_id: str, client_secret: str):
@@ -19,6 +21,11 @@ class SharePointDownloader:
         self.site_id: str = site_id
         self.local_root: str = local_root
         self.timestamp: str = timestamp
+        self.tmp_path = os.path.join(local_root, TMP_DIR)
+        if (os.path.exists(os.path.join(self.tmp_path))):
+            shutil.rmtree(self.tmp_path)
+        os.makedirs(self.tmp_path, exist_ok=True)
+        self.external_files: list[str] = []
 
     def initializeClient(tenant_id: str, client_id: str, client_secret: str) -> GraphServiceClient:
         cred = ClientSecretCredential(tenant_id=tenant_id, client_id=client_id, client_secret=client_secret)
@@ -42,6 +49,8 @@ class SharePointDownloader:
             else:
                 if getattr(item, "name", None):
                     await self.download_file(drive_id, drive_name, item)
+        self.save_deleted_files(drive_name)
+        self.move_tmp_to_permanent()
 
     async def list_listeners(self):
         result = await self.client.identity.authentication_event_listeners.get()
@@ -75,6 +84,7 @@ class SharePointDownloader:
         file_path = os.path.join(folder_path, item.name)
         full_file_path = os.path.join(self.local_root, file_path)
         remote_size = 0
+        self.external_files.append(file_path)
 
         if os.path.exists(os.path.join(full_file_path)):
             if item.file and item.file.hashes and item.file.hashes.quick_xor_hash:
@@ -86,36 +96,47 @@ class SharePointDownloader:
                     return remote_size
                 else:
                     self.logger.info(f"UPDATE --- {full_file_path} --- File exists but content differs, downloading...")
-                    self.save_outdated_file(folder_path, file_path)
+                    self.save_outdated_file(file_path)
                     content = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id(item.id).content.get()
                     remote_content = content if isinstance(content, bytes) else b""
                     remote_size = item.size
                     write_file(full_file_path, remote_content)
-
         else:
             self.logger.info(f"INSERT --- {full_file_path} --- File doesn't exist locally, downloading...")
             remote_content = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id(item.id).content.get()
             remote_size = item.size
             write_file(full_file_path, remote_content)
         return remote_size
+    
+    def save_deleted_files(self, drive_name: str):
+        drive_path = os.path.join(self.local_root, drive_name)
+        existing_files: set[str] = list_files_relative(drive_path, drive_name)
+        external_files_set: set[str] = set(self.external_files)
+        #print(existing_files)
+        #print(external_files_set)
+        deleted_files = existing_files - external_files_set
+        for deleted_file in deleted_files:
+            self.save_outdated_file(deleted_file)
+
+
+
 
     def make_folder(self, folder_path: str):
-        folder_path = os.path.join(self.local_root, folder_path)
+        folder_path = os.path.join(self.tmp_path, folder_path)
         os.makedirs(folder_path, exist_ok=True)
     
-    def save_outdated_file(self, folder_path: str, file_path: str):
+    def save_outdated_file(self, file_path: str):
         saves_dir = os.path.join(self.local_root, SAVES_DIR)
         saves_dir = os.path.join(saves_dir, self.timestamp)
-        destination_folder_path = os.path.join(saves_dir, folder_path)
+        destination_folder_path = os.path.join(saves_dir, Path(file_path).parent)
 
         os.makedirs(destination_folder_path, exist_ok=True)
-
         destination_file_path = os.path.join(saves_dir, file_path)
-        
         origin = os.path.join(self.local_root, file_path)
         shutil.copy(origin, destination_file_path)
 
-        print("Copied file: " + origin + " to file " + destination_file_path)
+    def move_tmp_to_permanent(self):
+        pass
 
 def write_file(file_path: str, content: bytes):
     with open(os.path.join(file_path), "wb") as f:
