@@ -51,17 +51,21 @@ async def main():
     client_id = env_or_fail("CLIENT_ID")
     client_secret = env_or_fail("CLIENT_SECRET")
     timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-    drives = json.loads(os.getenv('DRIVES', '[]'))
+    drives_to_process = json.loads(os.getenv('DRIVES', '[]'))
     setup_logging_from_env(local_root, timestamp)
     obj = SharePointDownloader(site_id, local_root, timestamp, tenant_id, client_id, client_secret)
-    name_ids = await obj.list_all_drives()
-    #await obj.test_hash_algorithm()
-    for id, name in name_ids:
-        if name in drives:
-            try:
-                await obj.download_drive(id, name)
-            except Exception as e:
-                print(e)  
 
+    downloader = SharePointDownloader(site_id, local_root, timestamp, tenant_id, client_id, client_secret)
+    logger = logging.getLogger(__name__)
+
+    await downloader.getDriveNames(drives_to_process)
+    if not downloader.drive_name_ids:
+        logger.info("No drives matched the requested list. Exiting.")
+        return
+    
+    await downloader.download_drives()
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.getLogger(__name__).info("Interrupted by user. Exiting.")

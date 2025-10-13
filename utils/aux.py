@@ -7,7 +7,7 @@ def env_or_fail(name: str) -> str:
         raise RuntimeError(f"Missing environment variable {name}")
     return value
 
-def list_files_relative(base: str, drive_name: str) -> tuple[str]:
+def list_files_relative(base: str, drive_name: str) -> set[str]:
     base_path = Path(base)
     if not base_path.exists():
         raise FileNotFoundError(f"Base path does not exist: {base_path!s}")

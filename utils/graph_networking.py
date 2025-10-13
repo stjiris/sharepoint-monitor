@@ -1,3 +1,5 @@
+import asyncio
+import signal
 import logging
 import os
 from pathlib import Path
@@ -12,7 +14,6 @@ from .quickxorhash import quickxorhash_file_base64
 from .aux import list_files_relative
 LOGS_DIR = "logs"
 SAVES_DIR = "saves"
-TMP_DIR = "tmp"
 
 class SharePointDownloader:
     def __init__(self, site_id, local_root, timestamp, tenant_id: str, client_id: str, client_secret: str):
@@ -21,11 +22,9 @@ class SharePointDownloader:
         self.site_id: str = site_id
         self.local_root: str = local_root
         self.timestamp: str = timestamp
-        self.tmp_path = os.path.join(local_root, TMP_DIR)
-        if (os.path.exists(os.path.join(self.tmp_path))):
-            shutil.rmtree(self.tmp_path)
-        os.makedirs(self.tmp_path, exist_ok=True)
-        self.external_files: list[str] = []
+        self.external_files: set[str] = set()
+        self.drive_name: str = ""
+        self.drive_name_ids: set[tuple[str, str]]
 
     def initializeClient(tenant_id: str, client_id: str, client_secret: str) -> GraphServiceClient:
         cred = ClientSecretCredential(tenant_id=tenant_id, client_id=client_id, client_secret=client_secret)
@@ -33,7 +32,20 @@ class SharePointDownloader:
         client = GraphServiceClient(credentials=cred, scopes=scopes)
         return client
 
-    async def list_all_drives(self) -> list[str]:
+    async def getDriveNames(self, drive_names: list[str]):
+        drive_names = set(drive_names)
+        existing_drive_name_ids = await self.list_all_drives()
+        existing_drive_names = set([name for _, name in existing_drive_name_ids])
+        non_existing_drives = drive_names - existing_drive_names
+        if non_existing_drives:
+            self.logger.info(f'{non_existing_drives} - Drive(s) don\'t exist, skipping...')
+        self.drive_name_ids = {
+            (drive_id, drive_name)
+            for drive_id, drive_name in existing_drive_name_ids
+            if drive_name in drive_names
+        }
+
+    async def list_all_drives(self) -> set[tuple[str]]:
         resp = await self.client.sites.by_site_id(self.site_id).drives.get()
         drives = resp.value or []
         return [(d.id, d.name) for d in drives if getattr(d, "name", None) and getattr(d, "id", None)]
@@ -42,6 +54,7 @@ class SharePointDownloader:
         resp = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id("root").children.get()
         items = resp.value
         self.make_folder(drive_name)
+        self.drive_name = drive_name
 
         for item in items:
             if getattr(item, "folder", None) is not None and getattr(item, "name", None):
@@ -49,8 +62,7 @@ class SharePointDownloader:
             else:
                 if getattr(item, "name", None):
                     await self.download_file(drive_id, drive_name, item)
-        self.save_deleted_files(drive_name)
-        self.move_tmp_to_permanent()
+        self.save_files()
 
     async def list_listeners(self):
         result = await self.client.identity.authentication_event_listeners.get()
@@ -84,7 +96,7 @@ class SharePointDownloader:
         file_path = os.path.join(folder_path, item.name)
         full_file_path = os.path.join(self.local_root, file_path)
         remote_size = 0
-        self.external_files.append(file_path)
+        self.external_files.add(file_path)
 
         if os.path.exists(os.path.join(full_file_path)):
             if item.file and item.file.hashes and item.file.hashes.quick_xor_hash:
@@ -108,35 +120,57 @@ class SharePointDownloader:
             write_file(full_file_path, remote_content)
         return remote_size
     
-    def save_deleted_files(self, drive_name: str):
-        drive_path = os.path.join(self.local_root, drive_name)
-        existing_files: set[str] = list_files_relative(drive_path, drive_name)
-        external_files_set: set[str] = set(self.external_files)
-        #print(existing_files)
-        #print(external_files_set)
-        deleted_files = existing_files - external_files_set
+    def delete_outdated_files(self, file_path: str):
+        file_path = os.path.join(self.local_root, file_path)
+        os.remove(file_path)
+
+    def save_files(self):
+        drive_path = os.path.join(self.local_root, self.drive_name)
+        existing_files: set[str] = list_files_relative(drive_path, self.drive_name)
+        deleted_files = existing_files - self.external_files
         for deleted_file in deleted_files:
             self.save_outdated_file(deleted_file)
-
-
-
+            self.delete_outdated_files(deleted_file)
 
     def make_folder(self, folder_path: str):
-        folder_path = os.path.join(self.tmp_path, folder_path)
+        folder_path = os.path.join(self.local_root, folder_path)
         os.makedirs(folder_path, exist_ok=True)
     
     def save_outdated_file(self, file_path: str):
         saves_dir = os.path.join(self.local_root, SAVES_DIR)
         saves_dir = os.path.join(saves_dir, self.timestamp)
         destination_folder_path = os.path.join(saves_dir, Path(file_path).parent)
-
         os.makedirs(destination_folder_path, exist_ok=True)
         destination_file_path = os.path.join(saves_dir, file_path)
         origin = os.path.join(self.local_root, file_path)
         shutil.copy(origin, destination_file_path)
+    
+    async def download_drives(self):
+        for id, name in self.drive_name_ids:
+            self.drive_name = name
+            self.external_files = set()
+            try:
+                await self.download_drive(id, name)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.exception("Error downloading drive %s (%s)", name, id)
+        
+def install_signal_handlers(loop: asyncio.AbstractEventLoop, downloader: SharePointDownloader, task: asyncio.Task):
+    def _on_shutdown():
+        try:
+            loop.call_soon_threadsafe(downloader.save_files)
+        except Exception:
+            try:
+                downloader.save_files()
+            except Exception:
+                downloader.logger.exception("Failed to call save_files from signal handler")
 
-    def move_tmp_to_permanent(self):
-        pass
+        if not task.done():
+            task.cancel()
+
+    loop.add_signal_handler(signal.SIGINT, _on_shutdown)
+    loop.add_signal_handler(signal.SIGTERM, _on_shutdown)
 
 def write_file(file_path: str, content: bytes):
     with open(os.path.join(file_path), "wb") as f:
