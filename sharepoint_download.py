@@ -56,11 +56,9 @@ async def main():
     obj = SharePointDownloader(site_id, local_root, timestamp, tenant_id, client_id, client_secret)
 
     downloader = SharePointDownloader(site_id, local_root, timestamp, tenant_id, client_id, client_secret)
-    logger = logging.getLogger(__name__)
-
-    await downloader.getDriveNames(drives_to_process)
+    await downloader.initializeDriveNames(drives_to_process)
     if not downloader.drive_name_ids:
-        logger.info("No drives matched the requested list. Exiting.")
+        logging.getLogger(__name__).info("No drives matched the requested list. Exiting.")
         return
     
     await downloader.download_drives()

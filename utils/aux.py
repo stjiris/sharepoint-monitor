@@ -20,6 +20,6 @@ def list_files_relative(base: str, drive_name: str) -> set[str]:
             continue
         rel = p.relative_to(base_path)
         rel = os.path.join(drive_name, rel.as_posix())
-        files.append(rel)
+        files.append(Path(rel).parent.as_posix())
 
     return set(sorted(files))

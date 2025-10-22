@@ -1,153 +1,62 @@
 import asyncio
-import signal
 import logging
 import os
 from pathlib import Path
 import shutil
-import struct
-from typing import Optional
+import signal
+import aiofiles
+import aiohttp
+import json
 from azure.identity import ClientSecretCredential
 from msgraph import GraphServiceClient
 from msgraph.generated.models.drive_item import DriveItem
-import base64
 from .quickxorhash import quickxorhash_file_base64
 from .aux import list_files_relative
+
 LOGS_DIR = "logs"
 SAVES_DIR = "saves"
+
+GRAPH_BATCH_URL = "https://graph.microsoft.com/v1.0/$batch"
+GRAPH_BATCH_LIMIT = 20 
+
+CHUNK_SIZE = 64*1024
 
 class SharePointDownloader:
     def __init__(self, site_id, local_root, timestamp, tenant_id: str, client_id: str, client_secret: str):
         self.logger: logging.Logger = logging.getLogger(__name__)
-        self.client: GraphServiceClient = SharePointDownloader.initializeClient(tenant_id, client_id, client_secret)
+        self.credential = ClientSecretCredential(tenant_id=tenant_id, client_id=client_id, client_secret=client_secret)
+        self.scopes = ["https://graph.microsoft.com/.default"]
+        self.client: GraphServiceClient = SharePointDownloader.initializeClient(self.credential, self.scopes)
         self.site_id: str = site_id
         self.local_root: str = local_root
         self.timestamp: str = timestamp
         self.external_files: set[str] = set()
-        self.drive_name: str = ""
-        self.drive_name_ids: set[tuple[str, str]]
+        self.drive_name_ids: set[tuple[str, str]] = set()
 
-    def initializeClient(tenant_id: str, client_id: str, client_secret: str) -> GraphServiceClient:
-        cred = ClientSecretCredential(tenant_id=tenant_id, client_id=client_id, client_secret=client_secret)
-        scopes = ['https://graph.microsoft.com/.default']
+        self.pending: list[dict] = []
+        self.max_workers: int = 4
+        self.lock = asyncio.Lock()
+        self.worker_tasks: set[asyncio.Task] = set()
+
+    @staticmethod
+    def initializeClient(cred: ClientSecretCredential, scopes):
         client = GraphServiceClient(credentials=cred, scopes=scopes)
         return client
 
-    async def getDriveNames(self, drive_names: list[str]):
-        drive_names = set(drive_names)
-        existing_drive_name_ids = await self.list_all_drives()
-        existing_drive_names = set([name for _, name in existing_drive_name_ids])
-        non_existing_drives = drive_names - existing_drive_names
-        if non_existing_drives:
-            self.logger.info(f'{non_existing_drives} - Drive(s) don\'t exist, skipping...')
-        self.drive_name_ids = {
-            (drive_id, drive_name)
-            for drive_id, drive_name in existing_drive_name_ids
-            if drive_name in drive_names
-        }
+    
 
-    async def list_all_drives(self) -> set[tuple[str]]:
+
+    async def initializeDriveNames(self, drive_names: list[str]) -> None:
+        wanted = set(drive_names)
         resp = await self.client.sites.by_site_id(self.site_id).drives.get()
-        drives = resp.value or []
-        return [(d.id, d.name) for d in drives if getattr(d, "name", None) and getattr(d, "id", None)]
+        found = {(d.id, d.name) for d in (resp.value or []) if getattr(d, "id", None) and getattr(d, "name", None)}
+        missing = wanted - {name for _, name in found}
+        if missing:
+            self.logger.info(f"{missing} - Drive(s) don't exist, skipping...")
+        self.drive_name_ids = {pair for pair in found if pair[1] in wanted}
 
-    async def download_drive(self, drive_id: str, drive_name: str) -> None:
-        resp = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id("root").children.get()
-        items = resp.value
-        self.make_folder(drive_name)
-        self.drive_name = drive_name
-
-        for item in items:
-            if getattr(item, "folder", None) is not None and getattr(item, "name", None):
-                await self.download_folder(drive_id, drive_name, item)
-            else:
-                if getattr(item, "name", None):
-                    await self.download_file(drive_id, drive_name, item)
-        self.save_files()
-
-    async def list_listeners(self):
-        result = await self.client.identity.authentication_event_listeners.get()
-        print(result)
-
-    ###################
-    ### AUX METHODS ###
-    ###################
-
-    async def download_folder(self, drive_id: str, current_folder: str, folder_item: DriveItem) -> int:
-        folder_path = os.path.join(current_folder, folder_item.name)
-        self.make_folder(folder_path)
-
-        resp = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id(folder_item.id).children.get()
-        items = resp.value or []
-        
-        folder_total_size = 0
-        for item in items:
-            if getattr(item, "folder", None) is not None and getattr(item, "name", None):
-                subfolder_size = await self.download_folder(drive_id, folder_path, item)
-                folder_total_size += subfolder_size
-            else:
-                if getattr(item, "name", None):
-                    file_size = await self.download_file(drive_id, folder_path, item)
-                    folder_total_size += file_size
-        
-        return folder_total_size
-
-    async def download_file(self, drive_id: str, folder_path: str, item: DriveItem) -> int:
-
-        file_path = os.path.join(folder_path, item.name)
-        full_file_path = os.path.join(self.local_root, file_path)
-        remote_size = 0
-        self.external_files.add(file_path)
-
-        if os.path.exists(os.path.join(full_file_path)):
-            if item.file and item.file.hashes and item.file.hashes.quick_xor_hash:
-                remote_hash = item.file.hashes.quick_xor_hash
-                local_hash = quickxorhash_file_base64(full_file_path)
-
-                if local_hash == remote_hash:
-                    self.logger.info(f"SKIP --- {full_file_path} --- File exists and content is identical")
-                    return remote_size
-                else:
-                    self.logger.info(f"UPDATE --- {full_file_path} --- File exists but content differs, downloading...")
-                    self.save_outdated_file(file_path)
-                    content = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id(item.id).content.get()
-                    remote_content = content if isinstance(content, bytes) else b""
-                    remote_size = item.size
-                    write_file(full_file_path, remote_content)
-        else:
-            self.logger.info(f"INSERT --- {full_file_path} --- File doesn't exist locally, downloading...")
-            remote_content = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id(item.id).content.get()
-            remote_size = item.size
-            write_file(full_file_path, remote_content)
-        return remote_size
-    
-    def delete_outdated_files(self, file_path: str):
-        file_path = os.path.join(self.local_root, file_path)
-        os.remove(file_path)
-
-    def save_files(self):
-        drive_path = os.path.join(self.local_root, self.drive_name)
-        existing_files: set[str] = list_files_relative(drive_path, self.drive_name)
-        deleted_files = existing_files - self.external_files
-        for deleted_file in deleted_files:
-            self.save_outdated_file(deleted_file)
-            self.delete_outdated_files(deleted_file)
-
-    def make_folder(self, folder_path: str):
-        folder_path = os.path.join(self.local_root, folder_path)
-        os.makedirs(folder_path, exist_ok=True)
-    
-    def save_outdated_file(self, file_path: str):
-        saves_dir = os.path.join(self.local_root, SAVES_DIR)
-        saves_dir = os.path.join(saves_dir, self.timestamp)
-        destination_folder_path = os.path.join(saves_dir, Path(file_path).parent)
-        os.makedirs(destination_folder_path, exist_ok=True)
-        destination_file_path = os.path.join(saves_dir, file_path)
-        origin = os.path.join(self.local_root, file_path)
-        shutil.copy(origin, destination_file_path)
-    
     async def download_drives(self):
         for id, name in self.drive_name_ids:
-            self.drive_name = name
             self.external_files = set()
             try:
                 await self.download_drive(id, name)
@@ -155,14 +64,231 @@ class SharePointDownloader:
                 raise
             except Exception:
                 self.logger.exception("Error downloading drive %s (%s)", name, id)
+
+    async def download_drive(self, drive_id: str, drive_name: str) -> None:
+        resp = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id("root").children.get()
+        items = resp.value or []
+
+        self.make_folder(drive_name)
+
+        for item in items:
+            name = getattr(item, "name", None)
+            if not name:
+                continue
+            if getattr(item, "folder", None) is not None:
+                await self.collect_folder_files(drive_id, drive_name, item)
+            else:
+                self.pending.append({"drive_id": drive_id, "folder_path": drive_name, "item": item})
+
+        while self.pending:
+            await self.process_pending_files(True)
         
+        if self.worker_tasks:
+            await asyncio.gather(*self.worker_tasks, return_exceptions=True)
+        self.save_outdated_files(drive_name, finished=True)
+
+    async def collect_folder_files(self, drive_id: str, current_folder: str, folder_item) -> list[dict]:
+        path = os.path.join(current_folder, folder_item.name)
+        self.make_folder(path)
+
+        resp = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id(folder_item.id).children.get()
+        items = resp.value or []
+
+        for it in items:
+            name = getattr(it, "name", None)
+            if not name:
+                continue
+            if getattr(it, "folder", None) is not None:
+                await self.collect_folder_files(drive_id, path, it)
+            else:
+                async with self.lock:
+                    self.pending.append({"drive_id": drive_id, "folder_path": path, "item": it})
+                await self.process_pending_files()
+        return self.pending
+
+    async def process_pending_files(self, final: bool = False) -> None:
+        async with self.lock:
+            if not final and len(self.pending) < GRAPH_BATCH_LIMIT:
+                return
+
+            if len(self.pending) >= GRAPH_BATCH_LIMIT:
+                batch = self.pending[:GRAPH_BATCH_LIMIT]
+                self.pending = self.pending[GRAPH_BATCH_LIMIT:]
+            else:
+                batch = self.pending
+                self.pending = []
+
+        if len(self.worker_tasks) < self.max_workers:
+            task = asyncio.create_task(self.process_batch(batch))
+            self.worker_tasks.add(task)
+            task.add_done_callback(lambda t: self.worker_tasks.discard(t))
+
+    async def process_batch(self, batch: list[dict]) -> None:
+        session = None
+        try:
+            try:
+                token = await self._get_bearer_token()
+            except asyncio.CancelledError:
+                self.logger.info("process_batch cancelled while obtaining token; re-queueing batch")
+                async with self.lock:
+                    self.pending = batch + self.pending
+                return
+
+            timeout = aiohttp.ClientTimeout(total=60)
+            session = aiohttp.ClientSession(timeout=timeout)
+            requests_payload = []
+            self.logger.info(f"Processing batch of {len(batch)} items")
+            for j, e in enumerate(batch):
+                requests_payload.append({
+                    "id": str(j),
+                    "method": "GET",
+                    "url": f"/drives/{e['drive_id']}/items/{e['item'].id}?$select=id,name,size,@microsoft.graph.downloadUrl,file,hashes"
+                })
+
+            headers = {"Authorization": token, "Content-Type": "application/json"}
+            try:
+                async with session.post(GRAPH_BATCH_URL, json={"requests": requests_payload}, headers=headers) as resp:
+                    if resp.status == 200:
+                        try:
+                            res_json = await asyncio.wait_for(resp.json(), timeout=30)
+                            responses = {r["id"]: r for r in res_json.get("responses", [])}
+                        except asyncio.TimeoutError:
+                            self.logger.error("Timed out reading batch JSON response")
+                            responses = {}
+                    else:
+                        self.logger.error(f"Graph batch failed: {resp.status}")
+                        responses = {}
+            except asyncio.CancelledError:
+                self.logger.info("process_batch cancelled during batch POST; re-queueing batch")
+                async with self.lock:
+                    self.pending = batch + self.pending
+                return
+            except Exception:
+                self.logger.exception("Exception when posting batch to Graph")
+                responses = {}
+
+            for j, entry in enumerate(batch):
+                try:
+                    resp_item = responses.get(str(j), {})
+                    body = resp_item.get("body", {}) if resp_item.get("status") == 200 else {}
+                    download_url = body.get("@microsoft.graph.downloadUrl")
+                    size = body.get("size") or getattr(entry["item"], "size", 0)
+                    hashes = body.get("file", {}).get("hashes", {}) if body.get("file") else body.get("hashes", {}) or {}
+                    xor_hash = hashes.get("quickXorHash")
+
+                    folder_rel = os.path.join(entry["folder_path"], entry["item"].name)
+                    full_folder = os.path.join(self.local_root, folder_rel)
+                    full_file = os.path.join(full_folder, entry["item"].name)
+                    os.makedirs(full_folder, exist_ok=True)
+
+                    if not file_changed(full_file, size, xor_hash):
+                        self.logger.info(f"SKIP --- File {entry['item'].name} up to date")
+                        self.external_files.add(folder_rel)
+                        continue
+
+                    if download_url:
+                        url, hdrs = download_url, None
+                    else:
+                        url = f"https://graph.microsoft.com/v1.0/drives/{entry['drive_id']}/items/{entry['item'].id}/content"
+                        hdrs = {"Authorization": token}
+
+                    try:
+                        async with session.get(url, headers=hdrs) as r:
+                            if r.status not in (200, 206):
+                                self.logger.error(f"Failed to download {entry['item'].name}: {r.status}")
+                                continue
+
+                            if os.path.exists(full_file):
+                                self.logger.info(f"UPDATE --- File {entry['item'].name} outdated, updating...")
+                                self.save_outdated_file(folder_rel)
+                            else:
+                                self.logger.info(f"INSERT --- File {entry['item'].name} new, inserting...")
+
+                            async with aiofiles.open(os.path.join(full_folder, "metadata.json"), "w") as mf:
+                                await mf.write(json.dumps({"size": size, "xor_hash": xor_hash}))
+
+                            async with aiofiles.open(full_file, "wb") as fh:
+                                async for chunk in r.content.iter_chunked(CHUNK_SIZE):
+                                    await fh.write(chunk)
+
+                            self.external_files.add(folder_rel)
+                    except asyncio.CancelledError:
+                        self.logger.info("Download cancelled; re-queueing remaining items")
+                        remaining = batch[j:]
+                        async with self.lock:
+                            self.pending = remaining + self.pending
+                        return
+                    except Exception:
+                        self.logger.exception(f"Error downloading {entry['item'].name}")
+
+                except Exception:
+                    self.logger.exception(f"Error processing entry {entry.get('item')}")
+            self.logger.info(f"Finished processing batch of {len(batch)} items")
+                
+
+        except asyncio.CancelledError:
+            self.logger.info("Worker cancelled; re-queueing entire batch")
+            async with self.lock:
+                self.pending = batch + self.pending
+            raise
+        except Exception:
+            self.logger.exception("Worker encountered an exception")
+            raise
+        finally:
+            try:
+                if session:
+                    await session.close()
+            except Exception:
+                pass
+
+
+
+    async def _get_bearer_token(self) -> str:
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(None, lambda: self.credential.get_token(*self.scopes))
+        try:
+            tok = await fut
+            return f"Bearer {tok.token}"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception("Failed to obtain token")
+            raise
+
+
+    def delete_outdated_files(self, file_path: str) -> None:
+        file_path = os.path.join(self.local_root, file_path)
+        os.removedirs(file_path)
+
+    def save_outdated_files(self, drive_name: str, finished: bool = False) -> None:
+        drive_path = os.path.join(self.local_root, drive_name)
+        existing_files: set[str] = list_files_relative(drive_path, drive_name)
+        deleted_files = existing_files - self.external_files
+        for deleted_file in deleted_files:
+            self.save_outdated_file(deleted_file)
+            if finished:
+                self.delete_outdated_files(deleted_file)
+
+    def make_folder(self, folder_path: str) -> None:
+        folder_path = os.path.join(self.local_root, folder_path)
+        os.makedirs(folder_path, exist_ok=True)
+    
+    def save_outdated_file(self, file_path: str) -> None:
+        saves_dir = os.path.join(self.local_root, SAVES_DIR)
+        saves_dir = os.path.join(saves_dir, self.timestamp)
+        destination_folder_path = os.path.join(saves_dir, Path(file_path).parent)
+        os.makedirs(destination_folder_path, exist_ok=True)
+        destination_file_path = os.path.join(saves_dir, file_path)
+        origin = os.path.join(self.local_root, file_path)
+        shutil.copytree(origin, destination_file_path, dirs_exist_ok=True)
+
 def install_signal_handlers(loop: asyncio.AbstractEventLoop, downloader: SharePointDownloader, task: asyncio.Task):
     def _on_shutdown():
         try:
-            loop.call_soon_threadsafe(downloader.save_files)
+            loop.call_soon_threadsafe(downloader.save_outdated_files)
         except Exception:
             try:
-                downloader.save_files()
+                downloader.save_outdated_files()
             except Exception:
                 downloader.logger.exception("Failed to call save_files from signal handler")
 
@@ -172,6 +298,12 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop, downloader: SharePo
     loop.add_signal_handler(signal.SIGINT, _on_shutdown)
     loop.add_signal_handler(signal.SIGTERM, _on_shutdown)
 
-def write_file(file_path: str, content: bytes):
-    with open(os.path.join(file_path), "wb") as f:
-        f.write(content)
+def file_changed(file_path: str, size: int, xor_hash: str) -> bool:
+    if not os.path.exists(file_path):
+        return True
+    with open(os.path.join(os.path.dirname(file_path), "metadata.json"), "r") as f:
+        metadata = json.load(f)
+    if metadata and metadata.get("size") == size and metadata.get("xor_hash") == xor_hash:
+        return False
+    else:
+        return True
