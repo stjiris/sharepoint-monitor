@@ -10,9 +10,7 @@ import aiohttp
 import json
 from azure.identity import ClientSecretCredential
 from msgraph import GraphServiceClient
-from msgraph.generated.models.drive_item import DriveItem
-from .aux import list_files_relative
-from .quickxorhash import quickxorhash_file_base64
+from .aux import file_changed, list_files_relative
 
 LOGS_DIR = "logs"
 SAVES_DIR = "saves"
@@ -132,8 +130,13 @@ class SharePointDownloader:
 		try:
 			try:
 				token = await self._get_bearer_token()
-			except asyncio.CancelledError:
-				self.logger.error("process_batch cancelled while obtaining token; re-queueing batch")
+			except (asyncio.CancelledError, asyncio.TimeoutError):
+				self.logger.error("process_batch cancelled/timeout while obtaining token; re-queueing batch")
+				async with self.lock:
+					self.pending = batch + self.pending
+				return
+			except Exception:
+				self.logger.error("process_batch failed to obtain token; re-queueing batch")
 				async with self.lock:
 					self.pending = batch + self.pending
 				return
@@ -185,6 +188,7 @@ class SharePointDownloader:
 					xor_hash = hashes.get("quickXorHash")
 					web_url = entry["item"].web_url
 					creation_date = entry["item"].created_date_time
+
 					# get only the day
 					creation_date = creation_date.strftime("%Y-%m-%d")
 					folder_rel = os.path.join(entry["folder_path"], entry["item"].name)
@@ -226,7 +230,7 @@ class SharePointDownloader:
 									await fh.write(chunk)
 
 							async with aiofiles.open(os.path.join(full_folder, "metadata.json"), "w") as mf:
-								metadata = {"size": size}
+								metadata = {"size": size, "original_path": folder_rel}
 								if xor_hash:
 									metadata["xor_hash"] = xor_hash
 								if web_url:
@@ -276,7 +280,7 @@ class SharePointDownloader:
 		loop = asyncio.get_running_loop()
 		fut = loop.run_in_executor(None, lambda: self.credential.get_token(*self.scopes))
 		try:
-			tok = await fut
+			tok = await asyncio.wait_for(fut, timeout=2)
 			return f"Bearer {tok.token}"
 		except asyncio.CancelledError:
 			raise
@@ -329,16 +333,3 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop, downloader: SharePo
 
 	loop.add_signal_handler(signal.SIGINT, _on_shutdown)
 	loop.add_signal_handler(signal.SIGTERM, _on_shutdown)
-
-
-def file_changed(file_path: str, size: int, xor_hash: str, url: str, creation_date: str) -> bool:
-	if not os.path.exists(file_path) or not os.path.exists(os.path.join(os.path.dirname(file_path), "metadata.json")):
-		return True
-
-	with open(os.path.join(os.path.dirname(file_path), "metadata.json"), "r") as f:
-		metadata = json.load(f)
-	if metadata and metadata.get("size") == size and metadata.get("url") == url and metadata.get(
-	    "creation_date") == creation_date:
-		return False
-	else:
-		return True
