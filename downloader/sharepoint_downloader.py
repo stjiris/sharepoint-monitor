@@ -18,7 +18,7 @@ SAVES_DIR = "saves"
 GRAPH_BATCH_URL = "https://graph.microsoft.com/v1.0/$batch"
 GRAPH_BATCH_LIMIT = 20
 
-WORKER_LIMIT = 2
+WORKER_LIMIT = 4
 
 CHUNK_SIZE = 64 * 1024
 
@@ -38,8 +38,9 @@ class SharePointDownloader:
 
 		self.pending: list[dict] = []
 		self.max_workers: int = WORKER_LIMIT
-		self.lock = asyncio.Lock()
+		self.pending_lock = asyncio.Lock()
 		self.worker_tasks: set[asyncio.Task] = set()
+		self.worker_lock = asyncio.Lock()
 
 	@staticmethod
 	def initializeClient(cred: ClientSecretCredential, scopes):
@@ -64,6 +65,7 @@ class SharePointDownloader:
 				raise
 			except Exception:
 				self.logger.error("Error downloading drive %s (%s)", name, id)
+				self.logger.error(traceback.format_exc())
 
 	async def download_drive(self, drive_id: str, drive_name: str) -> None:
 		resp = await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id("root").children.get()
@@ -78,13 +80,18 @@ class SharePointDownloader:
 			if getattr(item, "folder", None) is not None:
 				await self.collect_folder_files(drive_id, drive_name, item)
 			else:
-				self.pending.append({"drive_id": drive_id, "folder_path": drive_name, "item": item})
+				async with self.pending_lock:
+					self.pending.append({"drive_id": drive_id, "folder_path": drive_name, "item": item})
 
-		while self.pending:
+		while True:
 			await self.process_pending_files(True)
+			async with self.pending_lock:
+				if not self.pending:
+					break
 
-		if self.worker_tasks:
-			await asyncio.gather(*self.worker_tasks, return_exceptions=True)
+		async with self.worker_lock:
+			if self.worker_tasks:
+				await asyncio.gather(*self.worker_tasks, return_exceptions=True)
 		#self.save_outdated_files(drive_name)
 
 	async def collect_folder_files(self, drive_id: str, current_folder: str, folder_item) -> list[dict]:
@@ -101,17 +108,18 @@ class SharePointDownloader:
 			if getattr(it, "folder", None) is not None:
 				await self.collect_folder_files(drive_id, path, it)
 			else:
-				async with self.lock:
+				async with self.pending_lock:
 					self.pending.append({"drive_id": drive_id, "folder_path": path, "item": it})
 				await self.process_pending_files()
 		return self.pending
 
 	async def process_pending_files(self, final: bool = False) -> None:
-		async with self.lock:
-			if not final and len(self.pending) < GRAPH_BATCH_LIMIT:
+		async with self.worker_lock:
+			if len(self.worker_tasks) >= WORKER_LIMIT:
 				return
 
-			if len(self.worker_tasks) >= self.max_workers:
+		async with self.pending_lock:
+			if not final and len(self.pending) < GRAPH_BATCH_LIMIT:
 				return
 
 			if len(self.pending) >= GRAPH_BATCH_LIMIT:
@@ -121,9 +129,10 @@ class SharePointDownloader:
 				batch = self.pending
 				self.pending = []
 
+		async with self.worker_lock:
 			task = asyncio.create_task(self.process_batch(batch))
-			self.worker_tasks.add(task)
 			task.add_done_callback(lambda t: self.worker_tasks.discard(t))
+			self.worker_tasks.add(task)
 
 	async def process_batch(self, batch: list[dict]) -> None:
 		session = None
@@ -132,12 +141,12 @@ class SharePointDownloader:
 				token = await self._get_bearer_token()
 			except (asyncio.CancelledError, asyncio.TimeoutError):
 				self.logger.error("process_batch cancelled/timeout while obtaining token; re-queueing batch")
-				async with self.lock:
+				async with self.pending_lock:
 					self.pending = batch + self.pending
 				return
 			except Exception:
 				self.logger.error("process_batch failed to obtain token; re-queueing batch")
-				async with self.lock:
+				async with self.pending_lock:
 					self.pending = batch + self.pending
 				return
 
@@ -170,7 +179,7 @@ class SharePointDownloader:
 						responses = {}
 			except asyncio.CancelledError:
 				self.logger.error("process_batch cancelled during batch POST; re-queueing batch")
-				async with self.lock:
+				async with self.pending_lock:
 					self.pending = batch + self.pending
 				return
 			except Exception:
@@ -195,7 +204,7 @@ class SharePointDownloader:
 					full_folder = os.path.join(self.local_root, folder_rel)
 					full_file = os.path.join(full_folder, entry["item"].name)
 
-					if not file_changed(full_file, size, xor_hash, web_url, creation_date):
+					if not file_changed(full_file, size, xor_hash, web_url, creation_date, folder_rel):
 						self.logger.info(f"SKIP --- File {folder_rel} up to date")
 						#self.external_files.add(folder_rel)
 						continue
@@ -210,7 +219,7 @@ class SharePointDownloader:
 						async with session.get(url, headers=hdrs) as r:
 							if r.status not in (200, 206):
 								self.logger.error(f"Failed to download {folder_rel}: {r.status}")
-								async with self.lock:
+								async with self.pending_lock:
 									self.pending.append({
 									    "drive_id": entry["drive_id"],
 									    "folder_path": os.path.dirname(folder_rel),
@@ -229,21 +238,22 @@ class SharePointDownloader:
 								async for chunk in r.content.iter_chunked(CHUNK_SIZE):
 									await fh.write(chunk)
 
-							async with aiofiles.open(os.path.join(full_folder, "metadata.json"), "w") as mf:
-								metadata = {"size": size, "original_path": folder_rel}
+							async with aiofiles.open(os.path.join(full_folder, "metadata.json"), "w",
+							                         encoding="utf-8") as mf:
+								metadata = {"size": size, "original_path": Path(folder_rel).as_posix()}
 								if xor_hash:
 									metadata["xor_hash"] = xor_hash
 								if web_url:
 									metadata["url"] = web_url
 								if creation_date:
 									metadata["creation_date"] = creation_date
-								await mf.write(json.dumps(metadata))
+								await mf.write(json.dumps(metadata, ensure_ascii=False, indent=2))
 
 							#self.external_files.add(folder_rel)
 					except asyncio.CancelledError:
 						self.logger.error("Download cancelled; re-queueing remaining items")
 						remaining = batch[j:]
-						async with self.lock:
+						async with self.pending_lock:
 							self.pending = remaining + self.pending
 						return
 					except Exception:
@@ -256,14 +266,14 @@ class SharePointDownloader:
 					    f"Error processing entry {str(entry['item'].size) + ' ' + entry['folder_path'] + entry['item'].name}"
 					)
 					remaining = batch[j:]
-					async with self.lock:
+					async with self.pending_lock:
 						self.pending = remaining + self.pending
 					return
 			self.logger.info(f"Finished processing batch of {len(batch)} items")
 
 		except asyncio.CancelledError:
 			self.logger.info("Worker cancelled; re-queueing entire batch")
-			async with self.lock:
+			async with self.pending_lock:
 				self.pending = batch + self.pending
 			raise
 		except Exception:

@@ -28,14 +28,14 @@ def list_files_relative(base: str, drive_name: str) -> set[str]:
 	return set(sorted(files))
 
 
-def file_changed(file_path: str, size: int, xor_hash: str, url: str, creation_date: str) -> bool:
+def file_changed(file_path: str, size: int, xor_hash: str, url: str, creation_date: str, folder_rel: str) -> bool:
 	if not os.path.exists(file_path) or not os.path.exists(os.path.join(os.path.dirname(file_path), "metadata.json")):
 		return True
 
 	with open(os.path.join(os.path.dirname(file_path), "metadata.json"), "r") as f:
 		metadata = json.load(f)
 	if metadata and metadata.get("size") == size and metadata.get("url") == url and metadata.get(
-	    "creation_date") == creation_date:
+	    "creation_date") == creation_date and metadata.get("original_path") == folder_rel:
 		return False
 	else:
 		return True
