@@ -12,7 +12,6 @@ from azure.identity import ClientSecretCredential
 from msgraph import GraphServiceClient
 from .aux import file_changed, list_files_relative
 
-LOGS_DIR = "logs"
 SAVES_DIR = "saves"
 
 GRAPH_BATCH_URL = "https://graph.microsoft.com/v1.0/$batch"

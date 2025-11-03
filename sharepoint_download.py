@@ -1,27 +1,22 @@
 import asyncio
 from datetime import datetime
-from downloader.sharepoint_downloader import *
+from src.downloader import *
 from dotenv import load_dotenv
 import json
+
+from src.aux import env_or_fail
 
 load_dotenv()
 
 
-def env_or_fail(name: str) -> str:
-	value = os.environ.get(name)
-	if not value:
-		raise RuntimeError(f"Missing environment variable {name}")
-	return value
-
-
-def setup_logging_from_env(local_root: str, timestamp: str):
+def setup_logging_from_env(local_root: str, timestamp: str, log_dir: str):
 	enable_logging = os.getenv('ENABLE_LOGGING', 'True').lower() in ('true', '1', 'yes')
 	log_level = os.getenv('LOG_LEVEL', 'INFO')
 
 	if not enable_logging:
 		logging.getLogger().setLevel(logging.CRITICAL)
 
-	log_directory = os.path.join(local_root, LOGS_DIR)
+	log_directory = os.path.join(local_root, log_dir)
 	log_file = os.path.join(log_directory, f"{timestamp}.log")
 
 	os.makedirs(log_directory, exist_ok=True)
@@ -48,10 +43,10 @@ async def main():
 	tenant_id = env_or_fail("TENANT_ID")
 	client_id = env_or_fail("CLIENT_ID")
 	client_secret = env_or_fail("CLIENT_SECRET")
+	log_dir = env_or_fail("LOG_DIR")
 	timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 	drives_to_process = json.loads(os.getenv('DRIVES', '[]'))
-	setup_logging_from_env(local_root, timestamp)
-	obj = SharePointDownloader(site_id, local_root, timestamp, tenant_id, client_id, client_secret)
+	setup_logging_from_env(local_root, timestamp, log_dir)
 
 	downloader = SharePointDownloader(site_id, local_root, timestamp, tenant_id, client_id, client_secret)
 	await downloader.initializeDriveNames(drives_to_process)
