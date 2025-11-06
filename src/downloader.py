@@ -36,10 +36,6 @@ class SharePointDownloader:
 		self.drive_name_ids: set[tuple[str, str]] = set()
 
 		self.pending: list[dict] = []
-		self.max_workers: int = WORKER_LIMIT
-		self.pending_lock = asyncio.Lock()
-		self.worker_tasks: set[asyncio.Task] = set()
-		self.worker_lock = asyncio.Lock()
 
 	@staticmethod
 	def initializeClient(cred: ClientSecretCredential, scopes):
@@ -79,18 +75,13 @@ class SharePointDownloader:
 			if getattr(item, "folder", None) is not None:
 				await self.collect_folder_files(drive_id, drive_name, item)
 			else:
-				async with self.pending_lock:
-					self.pending.append({"drive_id": drive_id, "folder_path": drive_name, "item": item})
+				self.pending.append({"drive_id": drive_id, "folder_path": drive_name, "item": item})
 
 		while True:
 			await self.process_pending_files(True)
-			async with self.pending_lock:
-				if not self.pending:
-					break
+			if not self.pending:
+				break
 
-		async with self.worker_lock:
-			if self.worker_tasks:
-				await asyncio.gather(*self.worker_tasks, return_exceptions=True)
 		#self.save_outdated_files(drive_name)
 
 	async def collect_folder_files(self, drive_id: str, current_folder: str, folder_item) -> list[dict]:
@@ -107,52 +98,36 @@ class SharePointDownloader:
 			if getattr(it, "folder", None) is not None:
 				await self.collect_folder_files(drive_id, path, it)
 			else:
-				async with self.pending_lock:
-					self.pending.append({"drive_id": drive_id, "folder_path": path, "item": it})
-				await self.process_pending_files()
+				self.pending.append({"drive_id": drive_id, "folder_path": path, "item": it})
+		await self.process_pending_files()
 		return self.pending
 
 	async def process_pending_files(self, final: bool = False) -> None:
-		async with self.worker_lock:
-			if len(self.worker_tasks) >= WORKER_LIMIT:
-				return
+		if not final and len(self.pending) < GRAPH_BATCH_LIMIT:
+			return
 
-		async with self.pending_lock:
-			if not final and len(self.pending) < GRAPH_BATCH_LIMIT:
-				return
-
-			if len(self.pending) >= GRAPH_BATCH_LIMIT:
-				batch = self.pending[:GRAPH_BATCH_LIMIT]
-				self.pending = self.pending[GRAPH_BATCH_LIMIT:]
-			else:
-				batch = self.pending
-				self.pending = []
-
-		async with self.worker_lock:
-			task = asyncio.create_task(self.process_batch(batch))
-			task.add_done_callback(lambda t: self.worker_tasks.discard(t))
-			self.worker_tasks.add(task)
+		if len(self.pending) >= GRAPH_BATCH_LIMIT:
+			batch = self.pending[:GRAPH_BATCH_LIMIT]
+			self.pending = self.pending[GRAPH_BATCH_LIMIT:]
+		else:
+			batch = self.pending
+			self.pending = []
+		await self.process_batch(batch)
 
 	async def process_batch(self, batch: list[dict]) -> None:
 		session = None
 		try:
 			try:
-				token = await self._get_bearer_token()
-			except (asyncio.CancelledError, asyncio.TimeoutError):
-				self.logger.error("process_batch cancelled/timeout while obtaining token; re-queueing batch")
-				async with self.pending_lock:
-					self.pending = batch + self.pending
-				return
+				token = self._get_bearer_token()
 			except Exception:
 				self.logger.error("process_batch failed to obtain token; re-queueing batch")
-				async with self.pending_lock:
-					self.pending = batch + self.pending
+				self.pending = batch + self.pending
 				return
 
 			timeout = aiohttp.ClientTimeout(total=60)
 			session = aiohttp.ClientSession(timeout=timeout)
 			requests_payload = []
-			self.logger.info(f"Processing batch of {len(batch)} items")
+			#self.logger.info(f"Processing batch of {len(batch)} items")
 			for j, e in enumerate(batch):
 				requests_payload.append({
 				    "id":
@@ -178,8 +153,7 @@ class SharePointDownloader:
 						responses = {}
 			except asyncio.CancelledError:
 				self.logger.error("process_batch cancelled during batch POST; re-queueing batch")
-				async with self.pending_lock:
-					self.pending = batch + self.pending
+				self.pending = batch + self.pending
 				return
 			except Exception:
 				self.logger.error("Exception when posting batch to Graph")
@@ -218,12 +192,11 @@ class SharePointDownloader:
 						async with session.get(url, headers=hdrs) as r:
 							if r.status not in (200, 206):
 								self.logger.error(f"Failed to download {folder_rel}: {r.status}")
-								async with self.pending_lock:
-									self.pending.append({
-									    "drive_id": entry["drive_id"],
-									    "folder_path": os.path.dirname(folder_rel),
-									    "item": entry["item"]
-									})
+								self.pending.append({
+								    "drive_id": entry["drive_id"],
+								    "folder_path": os.path.dirname(folder_rel),
+								    "item": entry["item"]
+								})
 								continue
 							os.makedirs(full_folder, exist_ok=True)
 
@@ -252,8 +225,7 @@ class SharePointDownloader:
 					except asyncio.CancelledError:
 						self.logger.error("Download cancelled; re-queueing remaining items")
 						remaining = batch[j:]
-						async with self.pending_lock:
-							self.pending = remaining + self.pending
+						self.pending = remaining + self.pending
 						return
 					except Exception:
 						self.logger.error(traceback.format_exc())
@@ -265,15 +237,13 @@ class SharePointDownloader:
 					    f"Error processing entry {str(entry['item'].size) + ' ' + entry['folder_path'] + entry['item'].name}"
 					)
 					remaining = batch[j:]
-					async with self.pending_lock:
-						self.pending = remaining + self.pending
+					self.pending = remaining + self.pending
 					return
-			self.logger.info(f"Finished processing batch of {len(batch)} items")
+			#self.logger.info(f"Finished processing batch of {len(batch)} items")
 
 		except asyncio.CancelledError:
 			self.logger.info("Worker cancelled; re-queueing entire batch")
-			async with self.pending_lock:
-				self.pending = batch + self.pending
+			self.pending = batch + self.pending
 			raise
 		except Exception:
 			self.logger.error("Worker encountered an exception")
@@ -285,14 +255,10 @@ class SharePointDownloader:
 			except Exception:
 				pass
 
-	async def _get_bearer_token(self) -> str:
-		loop = asyncio.get_running_loop()
-		fut = loop.run_in_executor(None, lambda: self.credential.get_token(*self.scopes))
+	def _get_bearer_token(self) -> str:
 		try:
-			tok = await asyncio.wait_for(fut, timeout=2)
+			tok = self.credential.get_token(*self.scopes)
 			return f"Bearer {tok.token}"
-		except asyncio.CancelledError:
-			raise
 		except Exception:
 			self.logger.error("Failed to obtain token")
 			raise
